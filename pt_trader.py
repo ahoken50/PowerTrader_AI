@@ -321,24 +321,30 @@ def _refresh_paths_and_symbols():
 
 
 #API STUFF
+import hmac
+import hashlib
 API_KEY = ""
-BASE64_PRIVATE_KEY = ""
+SECRET_KEY = ""
+PASSPHRASE = ""
 
 try:
-    with open('r_key.txt', 'r', encoding='utf-8') as f:
+    with open('b_key.txt', 'r', encoding='utf-8') as f:
         API_KEY = (f.read() or "").strip()
-    with open('r_secret.txt', 'r', encoding='utf-8') as f:
-        BASE64_PRIVATE_KEY = (f.read() or "").strip()
+    with open('b_secret.txt', 'r', encoding='utf-8') as f:
+        SECRET_KEY = (f.read() or "").strip()
+    with open('b_pass.txt', 'r', encoding='utf-8') as f:
+        PASSPHRASE = (f.read() or "").strip()
 except Exception:
     API_KEY = ""
-    BASE64_PRIVATE_KEY = ""
+    SECRET_KEY = ""
+    PASSPHRASE = ""
 
-if not API_KEY or not BASE64_PRIVATE_KEY:
+if not API_KEY or not SECRET_KEY or not PASSPHRASE:
     print(
-        "\n[PowerTrader] Robinhood API credentials not found.\n"
-        "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
-        "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
-        "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
+        "\n[PowerTrader] Bitget API credentials not found.\n"
+        "Open the GUI and go to Settings → Bitget API → Setup Wizard.\n"
+        "That wizard will guide you to enter your API Key, Secret Key, and Passphrase,\n"
+        "and will save them so this trader can authenticate.\n"
     )
     raise SystemExit(1)
 
@@ -348,9 +354,9 @@ class CryptoAPITrading:
         self.path_map = dict(base_paths)
 
         self.api_key = API_KEY
-        private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
-        self.private_key = SigningKey(private_key_seed)
-        self.base_url = "https://trading.robinhood.com"
+        self.secret_key = SECRET_KEY
+        self.passphrase = PASSPHRASE
+        self.base_url = "https://api.bitget.com"
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = list(DCA_LEVELS)  # Hard DCA triggers (percent PnL)
@@ -1095,8 +1101,7 @@ class CryptoAPITrading:
 
 
     def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
-
-        timestamp = self._get_current_timestamp()
+        timestamp = str(int(time.time() * 1000))
         headers = self.get_authorization_header(method, path, body, timestamp)
         url = self.base_url + path
 
@@ -1104,56 +1109,118 @@ class CryptoAPITrading:
             if method == "GET":
                 response = requests.get(url, headers=headers, timeout=10)
             elif method == "POST":
-                response = requests.post(url, headers=headers, json=json.loads(body), timeout=10)
+                response = requests.post(url, headers=headers, json=json.loads(body) if body else {}, timeout=10)
 
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            # Bitget uses string "00000" or int 0 for success
+            if str(data.get("code")) not in ("00000", "0", "None"):
+                return data 
+            return data
         except requests.HTTPError as http_err:
             try:
-                # Parse and return the JSON error response
-                error_response = response.json()
-                return error_response  # Return the JSON error for further handling
+                return response.json()
             except Exception:
                 return None
         except Exception:
             return None
 
-    def get_authorization_header(
-            self, method: str, path: str, body: str, timestamp: int
-    ) -> Dict[str, str]:
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
+    def get_authorization_header(self, method: str, path: str, body: str, timestamp: str) -> Dict[str, str]:
+        method = method.upper()
+        body = body or ""
+        message_to_sign = f"{timestamp}{method}{path}{body}"
+        signature = hmac.new(
+            self.secret_key.encode("utf-8"),
+            message_to_sign.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+        signature_b64 = base64.b64encode(signature).decode("utf-8")
 
         return {
-            "x-api-key": self.api_key,
-            "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
-            "x-timestamp": str(timestamp),
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-SIGN": signature_b64,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "locale": "en-US",
+            "Content-Type": "application/json",
         }
 
     def get_account(self) -> Any:
-        path = "/api/v1/crypto/trading/accounts/"
-        return self.make_api_request("GET", path)
+        # Map to simulate Robinhood's buying power response for the rest of the app
+        path = "/api/v2/spot/account/assets?coin=USDT"
+        response = self.make_api_request("GET", path)
+        buying_power = 0.0
+        
+        if response and str(response.get("code")) == "00000":
+            data_list = response.get("data", [])
+            for item in data_list:
+                if item.get("coin") == "USDT":
+                    buying_power = float(item.get("available", 0.0))
+                    
+        return {"buying_power": buying_power}
 
     def get_holdings(self) -> Any:
-        path = "/api/v1/crypto/trading/holdings/"
-        return self.make_api_request("GET", path)
+        path = "/api/v2/spot/account/assets"
+        response = self.make_api_request("GET", path)
+        
+        results = []
+        if response and str(response.get("code")) == "00000":
+            data_list = response.get("data", [])
+            for item in data_list:
+                total = float(item.get("available", 0.0)) + float(item.get("frozen", 0.0) or 0.0)
+                if total > 0.0:
+                    results.append({
+                        "asset_code": item.get("coin"),
+                        "total_quantity": str(total)
+                    })
+        return {"results": results}
 
     def get_trading_pairs(self) -> Any:
-        path = "/api/v1/crypto/trading/trading_pairs/"
+        path = "/api/v2/spot/public/symbols"
         response = self.make_api_request("GET", path)
 
-        if not response or "results" not in response:
+        if not response or str(response.get("code")) != "00000":
             return []
 
-        trading_pairs = response.get("results", [])
-        if not trading_pairs:
-            return []
-
-        return trading_pairs
+        return response.get("data", [])
 
     def get_orders(self, symbol: str) -> Any:
-        path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
-        return self.make_api_request("GET", path)
+        if "-" in symbol:
+            parts = symbol.split("-")
+            bg_symbol = f"{parts[0]}USDT"
+        else:
+            bg_symbol = symbol
+            
+        path = f"/api/v2/spot/trade/history-orders?symbol={bg_symbol}"
+        response = self.make_api_request("GET", path)
+        
+        results = []
+        if response and str(response.get("code")) == "00000":
+            data_list = response.get("data", [])
+            for item in data_list:
+                # Map Bitget to Robinhood format where needed
+                bg_state = str(item.get("status", "")).lower()
+                state_map = {
+                    "filled": "filled", 
+                    "partially_filled": "partially_filled", 
+                    "cancelled": "canceled", 
+                    "new": "unfilled"
+                }
+                
+                results.append({
+                    "id": item.get("orderId"),
+                    "side": item.get("side", "buy"),
+                    "state": state_map.get(bg_state, bg_state),
+                    "created_at": item.get("cTime", "0"),
+                    "executions": [
+                        {
+                            "quantity": item.get("baseVolume", "0"),
+                            "effective_price": item.get("priceAvg", "0")
+                        }
+                    ]
+                })
+
+        return {"results": results}
 
     def calculate_cost_basis(self):
         holdings = self.get_holdings()
@@ -1178,7 +1245,7 @@ class CryptoAPITrading:
                 order for order in orders["results"]
                 if order["side"] == "buy" and order["state"] == "filled"
             ]
-            buy_orders.sort(key=lambda x: x["created_at"], reverse=True)
+            buy_orders.sort(key=lambda x: str(x["created_at"]), reverse=True)
 
             remaining_quantity = current_quantities[asset_code]
             total_cost = 0.0
@@ -1215,16 +1282,23 @@ class CryptoAPITrading:
         valid_symbols = []
 
         for symbol in symbols:
+            # Map symbol for Bitget (e.g., BTC-USD -> BTCUSDT)
             if symbol == "USDC-USD":
                 continue
 
-            path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
+            if "-" in symbol:
+                parts = symbol.split("-")
+                bg_symbol = f"{parts[0]}USDT"
+            else:
+                bg_symbol = symbol
+
+            path = f"/api/v2/spot/market/tickers?symbol={bg_symbol}"
             response = self.make_api_request("GET", path)
 
-            if response and "results" in response:
-                result = response["results"][0]
-                ask = float(result["ask_inclusive_of_buy_spread"])
-                bid = float(result["bid_inclusive_of_sell_spread"])
+            if response and str(response.get("code")) == "00000" and response.get("data"):
+                result = response["data"][0]
+                ask = float(result.get("askPr", 0.0))
+                bid = float(result.get("bidPr", 0.0))
 
                 buy_prices[symbol] = ask
                 sell_prices[symbol] = bid
@@ -1236,7 +1310,7 @@ class CryptoAPITrading:
                 except Exception:
                     pass
             else:
-                # Fallback to cached bid/ask so account value never drops due to a transient miss
+                # Fallback to cached bid/ask
                 cached = None
                 try:
                     cached = self._last_good_bid_ask.get(symbol)
@@ -1265,10 +1339,12 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
-        # Fetch the current price of the asset (for sizing only)
-        current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
-        current_price = current_buy_prices[symbol]
-        asset_quantity = amount_in_usd / current_price
+        
+        if "-" in symbol:
+            parts = symbol.split("-")
+            bg_symbol = f"{parts[0]}USDT"
+        else:
+            bg_symbol = symbol
 
         max_retries = 5
         retries = 0
@@ -1277,27 +1353,25 @@ class CryptoAPITrading:
             retries += 1
             response = None
             try:
-                # Default precision to 8 decimals initially
-                rounded_quantity = round(asset_quantity, 8)
-
+                # For Bitget Spot market buy, we purchase by specifying quoteAmount (USDT amount)
                 body = {
-                    "client_order_id": client_order_id,
-                    "side": side,
-                    "type": order_type,
-                    "symbol": symbol,
-                    "market_order_config": {
-                        "asset_quantity": f"{rounded_quantity:.8f}"  # Start with 8 decimal places
-                    }
+                    "symbol": bg_symbol,
+                    "side": "buy",
+                    "orderType": order_type,
+                    "force": "normal",
+                    "quoteAmount": f"{amount_in_usd:.4f}",
+                    "clientOid": client_order_id
                 }
 
-                path = "/api/v1/crypto/trading/orders/"
+                path = "/api/v2/spot/trade/place-order"
 
                 # --- exact profit tracking snapshot (BEFORE placing order) ---
                 buying_power_before = self._get_buying_power()
 
                 response = self.make_api_request("POST", path, json.dumps(body))
-                if response and "errors" not in response:
-                    order_id = response.get("id", None)
+                
+                if response and str(response.get("code")) == "00000":
+                    order_id = response.get("data", {}).get("orderId", None)
 
                     # Persist the pre-order buying power so restarts can reconcile precisely
                     try:
@@ -1316,12 +1390,11 @@ class CryptoAPITrading:
                     except Exception:
                         pass
 
-                    # Wait until the order is actually complete in the system, then use order history executions
+                    # Wait until the order is actually complete in the system
                     if order_id:
                         order = self._wait_for_order_terminal(symbol, order_id)
                         state = str(order.get("state", "")).lower().strip() if isinstance(order, dict) else ""
                         if state != "filled":
-                            # Not filled -> clear pending and do not record a trade
                             try:
                                 self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                                 self._save_pnl_ledger()
@@ -1334,7 +1407,6 @@ class CryptoAPITrading:
                         buying_power_after = self._get_buying_power()
                         buying_power_delta = float(buying_power_after) - float(buying_power_before)
 
-                        # Record for GUI history (ACTUAL fill from order history)
                         self._record_trade(
                             side="buy",
                             symbol=symbol,
@@ -1349,7 +1421,6 @@ class CryptoAPITrading:
                             buying_power_delta=buying_power_delta,
                         )
 
-                        # Clear pending now that it is recorded
                         try:
                             self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                             self._save_pnl_ledger()
@@ -1358,22 +1429,17 @@ class CryptoAPITrading:
 
                     return response  # Successfully placed (and fully filled) order
 
-            except Exception:
-                pass #print(traceback.format_exc())
+            except Exception as e:
+                pass
 
-            # Check for precision errors
-            if response and "errors" in response:
-                for error in response["errors"]:
-                    if "has too much precision" in error.get("detail", ""):
-                        # Extract required precision directly from the error message
-                        detail = error["detail"]
-                        nearest_value = detail.split("nearest ")[1].split(" ")[0]
-
-                        decimal_places = len(nearest_value.split(".")[1].rstrip("0"))
-                        asset_quantity = round(asset_quantity, decimal_places)
-                        break
-                    elif "must be greater than or equal to" in error.get("detail", ""):
-                        return None
+            # Detect Bitget precision errros and retry if needed
+            if response and str(response.get("code")) != "00000":
+                msg = str(response.get("msg", ""))
+                if "precision" in msg.lower():
+                    # Could handle dynamic precision reduction here if needed
+                    pass
+                elif "balance" in msg.lower() or "insufficient" in msg.lower():
+                    return None
 
         return None
 
@@ -1391,25 +1457,32 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        
+        if "-" in symbol:
+            parts = symbol.split("-")
+            bg_symbol = f"{parts[0]}USDT"
+        else:
+            bg_symbol = symbol
+            
+        # For Bitget Spot market sell, we sell by base quantity (amount of crypto)
         body = {
-            "client_order_id": client_order_id,
-            "side": side,
-            "type": order_type,
-            "symbol": symbol,
-            "market_order_config": {
-                "asset_quantity": f"{asset_quantity:.8f}"
-            }
+            "symbol": bg_symbol,
+            "side": "sell",
+            "orderType": order_type,
+            "force": "normal",
+            "size": f"{asset_quantity:.8f}",
+            "clientOid": client_order_id
         }
 
-        path = "/api/v1/crypto/trading/orders/"
+        path = "/api/v2/spot/trade/place-order"
 
         # --- exact profit tracking snapshot (BEFORE placing order) ---
         buying_power_before = self._get_buying_power()
 
         response = self.make_api_request("POST", path, json.dumps(body))
 
-        if response and isinstance(response, dict) and "errors" not in response:
-            order_id = response.get("id", None)
+        if response and isinstance(response, dict) and str(response.get("code")) == "00000":
+            order_id = response.get("data", {}).get("orderId", None)
 
             # Persist the pre-order buying power so restarts can reconcile precisely
             try:

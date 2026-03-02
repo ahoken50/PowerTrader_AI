@@ -21,47 +21,48 @@ import uuid
 from nacl.signing import SigningKey
 
 # -----------------------------
-# Robinhood market-data (current ASK), same source as rhcb.py trader:
-#   GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD
-#   use result["ask_inclusive_of_buy_spread"]
+# Bitget market-data (current ASK):
+#   GET /api/v2/spot/market/tickers?symbol=BTCUSDT
+#   use result["askPr"]
 # -----------------------------
-ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
+BITGET_BASE_URL = "https://api.bitget.com"
 
-_RH_MD = None  # lazy-init so import doesn't explode if creds missing
+_BG_MD = None  # lazy-init so import doesn't explode if creds missing
 
 
-class RobinhoodMarketData:
-    def __init__(self, api_key: str, base64_private_key: str, base_url: str = ROBINHOOD_BASE_URL, timeout: int = 10):
+class BitgetMarketData:
+    def __init__(self, api_key: str, secret_key: str, passphrase: str, base_url: str = BITGET_BASE_URL, timeout: int = 10):
         self.api_key = (api_key or "").strip()
+        self.secret_key = (secret_key or "").strip()
+        self.passphrase = (passphrase or "").strip()
         self.base_url = (base_url or "").rstrip("/")
         self.timeout = timeout
 
-        if not self.api_key:
-            raise RuntimeError("Robinhood API key is empty (r_key.txt).")
-
-        try:
-            raw_private = base64.b64decode((base64_private_key or "").strip())
-            self.private_key = SigningKey(raw_private)
-        except Exception as e:
-            raise RuntimeError(f"Failed to decode Robinhood private key (r_secret.txt): {e}")
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            raise RuntimeError("Bitget API credentials are missing (b_key.txt, b_secret.txt, b_pass.txt).")
 
         self.session = requests.Session()
 
-    def _get_current_timestamp(self) -> int:
-        return int(time.time())
+    def _get_current_timestamp(self) -> str:
+        return str(int(time.time() * 1000))
 
-    def _get_authorization_header(self, method: str, path: str, body: str, timestamp: int) -> dict:
-        # matches the trader's signing format
+    def _get_authorization_header(self, method: str, path: str, body: str, timestamp: str) -> dict:
         method = method.upper()
         body = body or ""
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-        signature_b64 = base64.b64encode(signed.signature).decode("utf-8")
+        message_to_sign = f"{timestamp}{method}{path}{body}"
+        signature = hmac.new(
+            self.secret_key.encode("utf-8"),
+            message_to_sign.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+        signature_b64 = base64.b64encode(signature).decode("utf-8")
 
         return {
-            "x-api-key": self.api_key,
-            "x-timestamp": str(timestamp),
-            "x-signature": signature_b64,
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-SIGN": signature_b64,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "locale": "en-US",
             "Content-Type": "application/json",
         }
 
@@ -72,48 +73,61 @@ class RobinhoodMarketData:
 
         resp = self.session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout)
         if resp.status_code >= 400:
-            raise RuntimeError(f"Robinhood HTTP {resp.status_code}: {resp.text}")
-        return resp.json()
+            raise RuntimeError(f"Bitget HTTP {resp.status_code}: {resp.text}")
+        
+        data = resp.json()
+        if str(data.get("code")) != "00000":
+             raise RuntimeError(f"Bitget API Error: {data.get('msg')}")
+             
+        return data
 
     def get_current_ask(self, symbol: str) -> float:
         symbol = (symbol or "").strip().upper()
-        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
+        # Map Robinhood "BTC-USD" format to Bitget "BTCUSDT"
+        if "-" in symbol:
+            parts = symbol.split("-")
+            bg_symbol = f"{parts[0]}USDT"
+        else:
+            bg_symbol = symbol
+
+        path = f"/api/v2/spot/market/tickers?symbol={bg_symbol}"
         data = self.make_api_request("GET", path)
 
-        if not data or "results" not in data or not data["results"]:
-            raise RuntimeError(f"Robinhood best_bid_ask returned no results for {symbol}: {data}")
+        if not data or "data" not in data or not data["data"]:
+            raise RuntimeError(f"Bitget returned no ticker for {bg_symbol}: {data}")
 
-        result = data["results"][0]
-        # EXACTLY like rhcb.py's get_price(): ask_inclusive_of_buy_spread
-        return float(result["ask_inclusive_of_buy_spread"])
+        result = data["data"][0]
+        return float(result["askPr"])
 
 
-def robinhood_current_ask(symbol: str) -> float:
+def bitget_current_ask(symbol: str) -> float:
     """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
+    Returns Bitget current BUY price for symbols like 'BTC-USD' (auto-mapped to BTCUSDT).
+    Reads creds from b_key.txt, b_secret.txt, b_pass.txt.
     """
-    global _RH_MD
-    if _RH_MD is None:
+    global _BG_MD
+    if _BG_MD is None:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
+        key_path = os.path.join(base_dir, "b_key.txt")
+        secret_path = os.path.join(base_dir, "b_secret.txt")
+        pass_path = os.path.join(base_dir, "b_pass.txt")
 
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+        if not os.path.isfile(key_path) or not os.path.isfile(secret_path) or not os.path.isfile(pass_path):
             raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
+                "Missing Bitget credentials next to pt_thinker.py. "
+                "Run pt_hub.py Settings to generate them."
             )
-
 
         with open(key_path, "r", encoding="utf-8") as f:
             api_key = f.read()
         with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
+            secret_key = f.read()
+        with open(pass_path, "r", encoding="utf-8") as f:
+            passphrase = f.read()
 
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
+        _BG_MD = BitgetMarketData(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
-    return _RH_MD.get_current_ask(symbol)
+    return _BG_MD.get_current_ask(symbol)
 
 
 def restart_program():
@@ -730,11 +744,11 @@ def step_coin(sym: str):
 		# reset tf_update for this coin (but DO NOT block-wait; just detect updates and return)
 		tf_update = ['no'] * len(tf_choices)
 
-		# get current price ONCE per coin — use Robinhood's current ASK (same as rhcb trader buy price)
+		# get current price ONCE per coin — use Bitget's current ASK
 		rh_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = robinhood_current_ask(rh_symbol)
+				current = bitget_current_ask(rh_symbol)
 				break
 			except Exception as e:
 				print(e)

@@ -47,7 +47,7 @@ For determining when to sell, the bot uses a trailing profit margin to maximize 
 
 THESE INSTRUCTIONS WERE WRITTEN BY AI! PLEASE LET ME KNOW IF THERE ARE ANY ERRORS OR ISSUES WITH THIS SETUP PROCESS!
 
-If you have any crypto holdings in Robinhood currently, either transfer them out of your Robinhood account or sell them to dollars BEFORE going through this setup process!
+If you have any crypto holdings in Bitget currently, ensure your API keys have spot trading permissions BEFORE going through this setup process!
 
 This page walks you through installing PowerTrader AI from start to finish, in the exact order a first-time user should do it.  
 No coding knowledge needed.  
@@ -105,7 +105,7 @@ This is the only thing you need to run day-to-day.
 
 ---
 
-## Step 5 — Set your folder, coins, and Robinhood keys (inside the Hub)
+## Step 5 — Set your folder, coins, and Bitget keys (inside the Hub)
 
 ### Open Settings
 
@@ -113,19 +113,21 @@ In the Hub, open **Settings** and do this in order:
 
 - **Main Neural Folder**: set this to the same folder that contains `pt_hub.py` (recommended easiest).
 - **Choose which coins to trade**: start with **BTC**.
-- **While you are still in Settings**, click **Robinhood API Setup** and do this:
+- **While you are still in Settings**, click **Bitget API Setup Wizard** and do this:
 
-1. Click **Generate Keys**.
-2. Copy the **Public Key** shown in the wizard.
-3. On Robinhood, add a new API key and paste that Public Key.
-4. Set permissions to allow trading (the wizard tells you what to select).
-5. Robinhood will show your API Key (often starts with `rh`). Copy it.
-6. Paste the API Key back into the wizard and click **Save**.
-7. Close the wizard and go back to the **Settings** screen.
-8. **NOW** click **Save** in Settings.
+1. Log into your Bitget account.
+2. Navigate to **API Management** and click **Create API Key**.
+3. Choose to create a System-generated API key.
+4. Set permissions to allow Spot Trading.
+5. Enter a **Passphrase** to secure your API Key.
+6. Bitget will provide your **API Key** and **Secret Key**.
+7. Paste the **API Key**, **Secret Key**, and **Passphrase** into the wizard and click **Test credentials**.
+8. If the test says Success, click **Save**.
+9. Close the wizard and go back to the **Settings** screen.
+10. **NOW** click **Save** in Settings.
 
-After saving, you will have two files in your PowerTrader AI folder:  
-`r_key.txt` and `r_secret.txt`  
+After saving, you will have three files in your PowerTrader AI folder:  
+`b_key.txt`, `b_secret.txt`, and `b_pass.txt`  
 Keep them private.
 
 PowerTrader AI uses a simple folder style:  
