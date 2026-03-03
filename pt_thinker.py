@@ -1,9 +1,6 @@
 import os
 import time
 import random
-import requests
-from kucoin.client import Market
-market = Market(url='https://api.kucoin.com')
 import sys
 import datetime
 import traceback
@@ -17,6 +14,10 @@ import psutil
 import logging
 import json
 import uuid
+import asyncio
+import aiohttp
+
+import db_manager
 
 from nacl.signing import SigningKey
 
@@ -30,7 +31,7 @@ BITGET_BASE_URL = "https://api.bitget.com"
 _BG_MD = None  # lazy-init so import doesn't explode if creds missing
 
 
-class BitgetMarketData:
+class AsyncBitgetMarketData:
     def __init__(self, api_key: str, secret_key: str, passphrase: str, base_url: str = BITGET_BASE_URL, timeout: int = 10):
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
@@ -40,8 +41,6 @@ class BitgetMarketData:
 
         if not self.api_key or not self.secret_key or not self.passphrase:
             raise RuntimeError("Bitget API credentials are missing (b_key.txt, b_secret.txt, b_pass.txt).")
-
-        self.session = requests.Session()
 
     def _get_current_timestamp(self) -> str:
         return str(int(time.time() * 1000))
@@ -66,22 +65,23 @@ class BitgetMarketData:
             "Content-Type": "application/json",
         }
 
-    def make_api_request(self, method: str, path: str, body: str = "") -> dict:
+    async def make_api_request(self, session: aiohttp.ClientSession, method: str, path: str, body: str = "") -> dict:
         url = f"{self.base_url}{path}"
         ts = self._get_current_timestamp()
         headers = self._get_authorization_header(method, path, body, ts)
 
-        resp = self.session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Bitget HTTP {resp.status_code}: {resp.text}")
-        
-        data = resp.json()
-        if str(data.get("code")) != "00000":
-             raise RuntimeError(f"Bitget API Error: {data.get('msg')}")
-             
-        return data
+        async with session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(f"Bitget HTTP {resp.status}: {text}")
+            
+            data = await resp.json()
+            if str(data.get("code")) != "00000":
+                 raise RuntimeError(f"Bitget API Error: {data.get('msg')}")
+                 
+            return data
 
-    def get_current_ask(self, symbol: str) -> float:
+    async def get_current_ask(self, session: aiohttp.ClientSession, symbol: str) -> float:
         symbol = (symbol or "").strip().upper()
         # Map Robinhood "BTC-USD" format to Bitget "BTCUSDT"
         if "-" in symbol:
@@ -91,7 +91,7 @@ class BitgetMarketData:
             bg_symbol = symbol
 
         path = f"/api/v2/spot/market/tickers?symbol={bg_symbol}"
-        data = self.make_api_request("GET", path)
+        data = await self.make_api_request(session, "GET", path)
 
         if not data or "data" not in data or not data["data"]:
             raise RuntimeError(f"Bitget returned no ticker for {bg_symbol}: {data}")
@@ -100,7 +100,7 @@ class BitgetMarketData:
         return float(result["askPr"])
 
 
-def bitget_current_ask(symbol: str) -> float:
+async def async_bitget_current_ask(session: aiohttp.ClientSession, symbol: str) -> float:
     """
     Returns Bitget current BUY price for symbols like 'BTC-USD' (auto-mapped to BTCUSDT).
     Reads creds from b_key.txt, b_secret.txt, b_pass.txt.
@@ -125,9 +125,21 @@ def bitget_current_ask(symbol: str) -> float:
         with open(pass_path, "r", encoding="utf-8") as f:
             passphrase = f.read()
 
-        _BG_MD = BitgetMarketData(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+        _BG_MD = AsyncBitgetMarketData(api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
-    return _BG_MD.get_current_ask(symbol)
+    return await _BG_MD.get_current_ask(session, symbol)
+
+async def kucoin_get_kline(session: aiohttp.ClientSession, symbol: str, tf: str) -> list:
+    url = f"https://api.kucoin.com/api/v1/market/candles?type={tf}&symbol={symbol}"
+    try:
+        async with session.get(url, timeout=10) as resp:
+            data = await resp.json()
+            if data and str(data.get('code')) == '200000':
+                return data.get('data', [])
+            return []
+    except Exception as e:
+        print(f"Kucoin API error: {e}")
+        return []
 
 
 def restart_program():
@@ -264,14 +276,13 @@ def _atomic_write_json(path: str, data: dict) -> None:
 		pass
 
 def _write_runner_ready(ready: bool, stage: str, ready_coins=None, total_coins: int = 0) -> None:
-	obj = {
-		"timestamp": time.time(),
-		"ready": bool(ready),
-		"stage": stage,
-		"ready_coins": ready_coins or [],
-		"total_coins": int(total_coins or 0),
-	}
-	_atomic_write_json(RUNNER_READY_PATH, obj)
+	try:
+		db_manager.set_process_ready("pt_thinker", ready)
+		db_manager.set_setting("thinker_stage", stage)
+		db_manager.set_setting("thinker_ready_coins", ready_coins or [])
+		db_manager.set_setting("thinker_total_coins", int(total_coins or 0))
+	except Exception as e:
+		pass
 
 
 # Ensure folders exist for the current configured coins
@@ -332,7 +343,7 @@ def _is_printing_real_predictions(messages) -> bool:
 	except Exception:
 		return False
 
-def _sync_coins_from_settings():
+async def _sync_coins_from_settings(session: aiohttp.ClientSession):
 	"""
 	Hot-reload coins from gui_settings.json while runner is running.
 
@@ -372,7 +383,7 @@ def _sync_coins_from_settings():
 			pass
 		try:
 			# init_coin switches CWD and does network calls, so do it carefully
-			init_coin(sym)
+			await init_coin(session, sym)
 			os.chdir(BASE_DIR)
 		except Exception:
 			try:
@@ -388,19 +399,17 @@ _write_runner_ready(False, stage="starting", ready_coins=[], total_coins=len(CUR
 
 
 
-def init_coin(sym: str):
+async def init_coin(session: aiohttp.ClientSession, sym: str):
 	# switch into the coin's folder so ALL existing relative file I/O stays working
 	os.chdir(coin_folder(sym))
 
 	# per-coin "version" + on/off files (no collisions between coins)
-	with open('alerts_version.txt', 'w+') as f:
-		f.write('5/3/2022/9am')
-
-	with open('futures_long_onoff.txt', 'w+') as f:
-		f.write('OFF')
-
-	with open('futures_short_onoff.txt', 'w+') as f:
-		f.write('OFF')
+	try:
+		db_manager.set_setting(f'{sym}_alerts_version', '5/3/2022/9am')
+		db_manager.set_setting(f'{sym}_futures_long_onoff', 'OFF')
+		db_manager.set_setting(f'{sym}_futures_short_onoff', 'OFF')
+	except Exception as e:
+		pass
 
 	st = new_coin_state()
 
@@ -411,10 +420,11 @@ def init_coin(sym: str):
 		history_list = []
 		while True:
 			try:
-				history = str(market.get_kline(coin, tf_choices[ind])).replace(']]', '], ').replace('[[', '[')
+				klines = await kucoin_get_kline(session, coin, tf_choices[ind])
+				history = str(klines).replace(']]', '], ').replace('[[', '[')
 				break
 			except Exception as e:
-				time.sleep(3.5)
+				await asyncio.sleep(3.5)
 				if 'Requests' in str(e):
 					pass
 				else:
@@ -436,9 +446,6 @@ def init_coin(sym: str):
 	st['tf_times'] = tf_times_local
 	states[sym] = st
 
-# init all coins once (from GUI settings)
-for _sym in CURRENT_COINS:
-	init_coin(_sym)
 
 # restore CWD to base after init
 os.chdir(BASE_DIR)
@@ -488,7 +495,7 @@ def find_purple_area(lines):
     if purple_bottom is not None and purple_top is not None and purple_top > purple_bottom:
         return (purple_bottom, purple_top)
     return (None, None)
-def step_coin(sym: str):
+async def step_coin(session: aiohttp.ClientSession, sym: str):
 	# run inside the coin folder so all existing file reads/writes stay relative + isolated
 	os.chdir(coin_folder(sym))
 	coin = sym + '-USDT'
@@ -499,15 +506,12 @@ def step_coin(sym: str):
 	# skip this coin so no new trades can start until it is trained again.
 	if not _coin_is_trained(sym):
 		try:
-			# Prevent new trades (and DCA) by forcing signals to 0 and keeping PM at baseline.
-			with open('futures_long_profit_margin.txt', 'w+') as f:
-				f.write('0.25')
-			with open('futures_short_profit_margin.txt', 'w+') as f:
-				f.write('0.25')
-			with open('long_dca_signal.txt', 'w+') as f:
-				f.write('0')
-			with open('short_dca_signal.txt', 'w+') as f:
-				f.write('0')
+			try:
+				db_manager.set_setting(f'{sym}_long_profit_margin', 0.25)
+				db_manager.set_setting(f'{sym}_short_profit_margin', 0.25)
+				db_manager.update_signals(sym, 0, 0)
+			except Exception as e:
+				pass
 		except Exception:
 			pass
 		try:
@@ -562,15 +566,15 @@ def step_coin(sym: str):
 	last_difference_between = 0.0
 
 
-	# ====== ORIGINAL: fetch current candle for this timeframe index ======
 	while True:
 		history_list = []
 		while True:
 			try:
-				history = str(market.get_kline(coin, tf_choices[tf_choice_index])).replace(']]', '], ').replace('[[', '[')
+				klines = await kucoin_get_kline(session, coin, tf_choices[tf_choice_index])
+				history = str(klines).replace(']]', '], ').replace('[[', '[')
 				break
 			except Exception as e:
-				time.sleep(3.5)
+				await asyncio.sleep(3.5)
 				if 'Requests' in str(e):
 					pass
 				else:
@@ -580,7 +584,7 @@ def step_coin(sym: str):
 		# KuCoin can occasionally return an empty/short kline response.
 		# Guard against history_list[1] raising IndexError.
 		if len(history_list) < 2:
-			time.sleep(0.2)
+			await asyncio.sleep(0.2)
 			continue
 		working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
 		try:
@@ -591,7 +595,52 @@ def step_coin(sym: str):
 			continue
 
 
-	current_candle = 100 * ((closePrice - openPrice) / openPrice)
+	# ====== PANDAS INDICATOR UPGRADE ======
+	import pandas as pd
+	import pandas_ta as ta
+	import numpy as np
+	
+	try:
+		# Build a quick DataFrame from the fetched history list
+		# history_list has items like: [time, open, close, high, low, volume, amount]
+		df_data = []
+		for item in history_list:
+			working_minute = str(item).replace('"', '').replace("'", "").replace('[', '').replace(']', '').split(", ")
+			if len(working_minute) >= 5:
+				df_data.append({
+					'open': float(working_minute[1]),
+					'close': float(working_minute[2]),
+					'high': float(working_minute[3]),
+					'low': float(working_minute[4])
+				})
+		
+		# Limit to something reasonable so pandas-ta has enough history (e.g., last 30 candles)
+		# But keep the array aligned with however pt_trainer made the pattern.
+		df = pd.DataFrame(df_data)
+		
+		df['price_change'] = 100 * ((df['close'] - df['open']) / df['open'])
+		
+		# TA-Lib Indicators
+		df.ta.rsi(length=14, append=True)
+		df.ta.macd(fast=12, slow=26, signal=9, append=True)
+		df.ta.bbands(length=20, std=2, append=True)
+
+		df.ffill(inplace=True)
+		df.fillna(0, inplace=True)
+		
+		# The most recent candle's data
+		current_candle = df['price_change'].iloc[-1]
+		current_rsi = df['RSI_14'].iloc[-1]
+		current_macd = df['MACDh_12_26_9'].iloc[-1]
+		current_bb = df['BBP_20_2.0'].iloc[-1]
+		
+	except Exception as e:
+		PrintException()
+		current_candle = 100 * ((closePrice - openPrice) / openPrice)
+		current_rsi = 50.0 # Neural default
+		current_macd = 0.0
+		current_bb = 0.5
+	# ======================================
 
 	# ====== ORIGINAL: load threshold + memories/weights and compute moves ======
 	file = open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt', 'r')
@@ -635,14 +684,31 @@ def step_coin(sym: str):
 			memory_pattern = memory_list[mem_ind].split('{}')[0].replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
 			check_dex = 0
 			memory_candle = float(memory_pattern[check_dex])
+			
+			# Check against RSI, MACD, and BB appended to the memory pattern in trainer
+			try:
+				mem_rsi = float(memory_pattern[-3])
+				mem_macd = float(memory_pattern[-2])
+				mem_bb = float(memory_pattern[-1])
+			except:
+				mem_rsi = 50.0
+				mem_macd = 0.0
+				mem_bb = 0.5
 
 			if current_candle == 0.0 and memory_candle == 0.0:
-				difference = 0.0
+				base_diff = 0.0
 			else:
 				try:
-					difference = abs((abs(current_candle - memory_candle) / ((current_candle + memory_candle) / 2)) * 100)
+					base_diff = abs((abs(current_candle - memory_candle) / ((current_candle + memory_candle) / 2)) * 100)
 				except:
-					difference = 0.0
+					base_diff = 0.0
+					
+			# Indicator distance modifier
+			rsi_dist = abs((current_rsi - mem_rsi) / 100.0) # normalizer factor
+			macd_dist = abs(current_macd - mem_macd)
+			bb_dist = abs(current_bb - mem_bb)
+			
+			difference = base_diff + (rsi_dist * 2.0) + (bb_dist * 2.0) # penalize memories that don't match our current indicator landscape
 
 			diff_avg = difference
 
@@ -748,10 +814,11 @@ def step_coin(sym: str):
 		rh_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = bitget_current_ask(rh_symbol)
+				current = await async_bitget_current_ask(session, rh_symbol)
 				break
 			except Exception as e:
 				print(e)
+				await asyncio.sleep(1)
 				continue
 
 		# IMPORTANT: messages printed below use the bounds currently in state.
@@ -795,10 +862,11 @@ def step_coin(sym: str):
 			while True:
 
 				try:
-					history = str(market.get_kline(coin, tf_choices[inder])).replace(']]', '], ').replace('[[', '[')
+					klines = await kucoin_get_kline(session, coin, tf_choices[inder])
+					history = str(klines).replace(']]', '], ').replace('[[', '[')
 					break
 				except Exception as e:
-					time.sleep(3.5)
+					await asyncio.sleep(3.5)
 					if 'Requests' in str(e):
 						pass
 					else:
@@ -836,27 +904,60 @@ def step_coin(sym: str):
 				tf_sides.insert(inder, 'short')
 
 			elif current < low_bound_prices[inder] and high_tf_prices[inder] != low_tf_prices[inder]:
-				message = 'LONG on ' + tf_choices[inder] + ' timeframe. ' + format(((low_bound_prices[inder] - current) / abs(current)) * 100, '.8f') + ' Low Boundary: ' + str(low_bound_prices[inder])
-				if messaged[inder] != 'yes':
-					del messaged[inder]
-					messaged.insert(inder, 'yes')
+				# --- SIGNAL CONFIRMATION LAYER ---
+				# Prevent buying if RSI is overbought (>70) or MACD is aggressively dumping
+				safe_to_long = True
+				try:
+					if current_rsi > 70.0:
+						safe_to_long = False
+					if current_macd < -0.5: # MACD histogram is heavily negative
+						safe_to_long = False
+				except:
+					pass # fallback if indicators failed to load
+				
+				if safe_to_long:
+					message = 'LONG on ' + tf_choices[inder] + ' timeframe. ' + format(((low_bound_prices[inder] - current) / abs(current)) * 100, '.8f') + ' Low Boundary: ' + str(low_bound_prices[inder])
+					if messaged[inder] != 'yes':
+						del messaged[inder]
+						messaged.insert(inder, 'yes')
 
-				del margins[inder]
-				margins.insert(inder, ((low_tf_prices[inder] - current) / abs(current)) * 100)
+					del margins[inder]
+					margins.insert(inder, ((low_tf_prices[inder] - current) / abs(current)) * 100)
 
-				del tf_sides[inder]
-				tf_sides.insert(inder, 'long')
+					del tf_sides[inder]
+					tf_sides.insert(inder, 'long')
 
-				if 'LONG' in messages[inder]:
-					del messages[inder]
-					messages.insert(inder, message)
-					del updated[inder]
-					updated.insert(inder, 0)
+					if 'LONG' in messages[inder]:
+						del messages[inder]
+						messages.insert(inder, message)
+						del updated[inder]
+						updated.insert(inder, 0)
+					else:
+						del messages[inder]
+						messages.insert(inder, message)
+						del updated[inder]
+						updated.insert(inder, 1)
 				else:
-					del messages[inder]
-					messages.insert(inder, message)
-					del updated[inder]
-					updated.insert(inder, 1)
+					# Signal rejected by indicators! Treat as WITHIN
+					message = '(REJECTED) LONG OVERRIDDEN BY RSI/MACD on ' + tf_choices[inder] + ' timeframe.'
+					del margins[inder]
+					margins.insert(inder, 0.0)
+					
+					if message == messages[inder]:
+						del messages[inder]
+						messages.insert(inder, message)
+						del updated[inder]
+						updated.insert(inder, 0)
+					else:
+						del messages[inder]
+						messages.insert(inder, message)
+						del updated[inder]
+						updated.insert(inder, 1)
+						
+					del tf_sides[inder]
+					tf_sides.insert(inder, 'none')
+					del messaged[inder]
+					messaged.insert(inder, 'no')
 
 			else:
 				if perfects[inder] == 'inactive':
@@ -973,10 +1074,11 @@ def step_coin(sym: str):
 		# bump bounds_version now that we've computed a new set of prediction bounds
 		st['bounds_version'] = bounds_version_used_for_messages + 1
 
-		with open('low_bound_prices.html', 'w+') as file:
-			file.write(str(new_low_bound_prices).replace("', '", " ").replace("[", "").replace("]", "").replace("'", ""))
-		with open('high_bound_prices.html', 'w+') as file:
-			file.write(str(new_high_bound_prices).replace("', '", " ").replace("[", "").replace("]", "").replace("'", ""))
+		# Persist new price levels to DB instead of HTML files
+		try:
+			db_manager.update_price_levels(sym, new_long_levels=new_low_bound_prices, new_short_levels=new_high_bound_prices)
+		except Exception as e:
+			print(f"Error saving price levels to DB for {sym}: {e}")
 
 		# cache display text for this coin (main loop prints everything on one screen)
 		try:
@@ -999,6 +1101,12 @@ def step_coin(sym: str):
 
 
 			all_ready = len(_ready_coins) >= len(COIN_SYMBOLS)
+			try:
+				db_manager.set_process_ready("pt_thinker", all_ready)
+				# Retain status print below
+			except Exception as e:
+				print(f"Error persisting readiness to DB: {e}")
+				
 			_write_runner_ready(
 				all_ready,
 				stage=("real_predictions" if all_ready else "warming_up"),
@@ -1026,24 +1134,13 @@ def step_coin(sym: str):
 			except:
 				pm = 0.25
 
-			with open('futures_long_profit_margin.txt', 'w+') as f:
-				f.write(str(pm))
-			with open('long_dca_signal.txt', 'w+') as f:
-				f.write(str(longs))
-
-			# short pm
-			current_pms = [m for m in margins if m != 0]
+			# Write signals to SQLite DB instead of file
 			try:
-				pm = sum(current_pms) / len(current_pms)
-				if pm < 0.25:
-					pm = 0.25
-			except:
-				pm = 0.25
-
-			with open('futures_short_profit_margin.txt', 'w+') as f:
-				f.write(str(abs(pm)))
-			with open('short_dca_signal.txt', 'w+') as f:
-				f.write(str(shorts))
+				db_manager.update_signals(sym, longs, shorts)
+				db_manager.set_setting(f"{sym}_long_profit_margin", pm)
+				db_manager.set_setting(f"{sym}_short_profit_margin", abs(pm))
+			except Exception as e:
+				print(f"DB Signal Update Error: {e}")
 
 		except:
 			PrintException()
@@ -1053,10 +1150,11 @@ def step_coin(sym: str):
 		while this_index_now < len(tf_update):
 			while True:
 				try:
-					history = str(market.get_kline(coin, tf_choices[this_index_now])).replace(']]', '], ').replace('[[', '[')
+					klines = await kucoin_get_kline(session, coin, tf_choices[this_index_now])
+					history = str(klines).replace(']]', '], ').replace('[[', '[')
 					break
 				except Exception as e:
-					time.sleep(3.5)
+					await asyncio.sleep(3.5)
 					if 'Requests' in str(e):
 						pass
 					else:
@@ -1106,25 +1204,36 @@ def step_coin(sym: str):
 
 
 
-try:
-	while True:
-		# Hot-reload coins from GUI settings while running
-		_sync_coins_from_settings()
+async def main_loop():
+	try:
+		async with aiohttp.ClientSession() as session:
+			# init all coins once (from GUI settings)
+			for _sym in CURRENT_COINS:
+				await init_coin(session, _sym)
+				
+			while True:
+				# Hot-reload coins from GUI settings while running
+				await _sync_coins_from_settings(session)
 
-		for _sym in CURRENT_COINS:
-			step_coin(_sym)
+				tasks = [step_coin(session, _sym) for _sym in CURRENT_COINS]
+				if tasks:
+					await asyncio.gather(*tasks)
 
-		# clear + re-print one combined screen (so you don't see old output above new)
-		os.system('cls' if os.name == 'nt' else 'clear')
+				# clear + re-print one combined screen (so you don't see old output above new)
+				os.system('cls' if os.name == 'nt' else 'clear')
 
-		for _sym in CURRENT_COINS:
-			print(display_cache.get(_sym, _sym + "  (no data yet)"))
-			print("\n" + ("-" * 60) + "\n")
+				for _sym in CURRENT_COINS:
+					print(display_cache.get(_sym, _sym + "  (no data yet)"))
+					print("\n" + ("-" * 60) + "\n")
 
-		# small sleep so you don't peg CPU when running many coins
-		time.sleep(0.15)
+				# small sleep so you don't peg CPU when running many coins
+				await asyncio.sleep(0.15)
 
-except Exception:
-	PrintException()
+	except Exception:
+		PrintException()
+
+
+if __name__ == "__main__":
+	asyncio.run(main_loop())
 
 

@@ -5,3 +5,6 @@ colorama
 cryptography
 PyNaCl
 kucoin-python
+pandas
+pandas-ta
+numpy

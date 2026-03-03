@@ -6,11 +6,12 @@ import time
 import math
 from typing import Any, Dict, Optional
 import requests
+import db_manager
 from nacl.signing import SigningKey
 import os
-import colorama
-from colorama import Fore, Style
 import traceback
+import asyncio
+import aiohttp
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
@@ -52,13 +53,12 @@ _gui_settings_cache = {
 	"pm_start_pct_no_dca": 5.0,
 	"pm_start_pct_with_dca": 2.5,
 	"trailing_gap_pct": 0.5,
+
+	# --- Risk Management ---
+	"global_stop_loss_pct": -15.0,
+	"dynamic_dca_atr": False,
+	"max_portfolio_exposure_pct": 85.0,
 }
-
-
-
-
-
-
 
 def _load_gui_settings() -> dict:
 	"""
@@ -162,6 +162,25 @@ def _load_gui_settings() -> dict:
 		if trailing_gap_pct < 0.0:
 			trailing_gap_pct = 0.0
 
+		# --- Risk Management ---
+		global_stop_loss_pct = data.get("global_stop_loss_pct", _gui_settings_cache.get("global_stop_loss_pct", -15.0))
+		try:
+			global_stop_loss_pct = float(str(global_stop_loss_pct).replace("%", "").strip())
+		except Exception:
+			global_stop_loss_pct = float(_gui_settings_cache.get("global_stop_loss_pct", -15.0))
+			
+		dynamic_dca_atr = data.get("dynamic_dca_atr", _gui_settings_cache.get("dynamic_dca_atr", False))
+		try:
+			dynamic_dca_atr = bool(dynamic_dca_atr)
+		except Exception:
+			dynamic_dca_atr = bool(_gui_settings_cache.get("dynamic_dca_atr", False))
+			
+		max_portfolio_exposure_pct = data.get("max_portfolio_exposure_pct", _gui_settings_cache.get("max_portfolio_exposure_pct", 85.0))
+		try:
+			max_portfolio_exposure_pct = float(str(max_portfolio_exposure_pct).replace("%", "").strip())
+		except Exception:
+			max_portfolio_exposure_pct = float(_gui_settings_cache.get("max_portfolio_exposure_pct", 85.0))
+
 
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
@@ -175,7 +194,10 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["pm_start_pct_no_dca"] = pm_start_pct_no_dca
 		_gui_settings_cache["pm_start_pct_with_dca"] = pm_start_pct_with_dca
 		_gui_settings_cache["trailing_gap_pct"] = trailing_gap_pct
-
+		
+		_gui_settings_cache["global_stop_loss_pct"] = global_stop_loss_pct
+		_gui_settings_cache["dynamic_dca_atr"] = dynamic_dca_atr
+		_gui_settings_cache["max_portfolio_exposure_pct"] = max_portfolio_exposure_pct
 
 		return {
 			"mtime": mtime,
@@ -190,6 +212,10 @@ def _load_gui_settings() -> dict:
 			"pm_start_pct_no_dca": pm_start_pct_no_dca,
 			"pm_start_pct_with_dca": pm_start_pct_with_dca,
 			"trailing_gap_pct": trailing_gap_pct,
+			
+			"global_stop_loss_pct": global_stop_loss_pct,
+			"dynamic_dca_atr": dynamic_dca_atr,
+			"max_portfolio_exposure_pct": max_portfolio_exposure_pct,
 		}
 
 
@@ -378,12 +404,12 @@ class CryptoAPITrading:
 
 
 
-        self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
-        self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
+        self.cost_basis = {}  # Initialized in run_async()
+        # self.initialize_dca_levels()  # Initialized in run_async()
 
         # GUI hub persistence
         self._pnl_ledger = self._load_pnl_ledger()
-        self._reconcile_pending_orders()
+        # self._reconcile_pending_orders(session) later
 
 
         # Cache last known bid/ask per symbol so transient API misses don't zero out account value
@@ -479,18 +505,68 @@ class CryptoAPITrading:
             return False
         return False
 
-    def _get_buying_power(self) -> float:
+    def _get_latest_atr(self, symbol: str, period: int = 14) -> float:
+        """
+        Calculates the Average True Range (ATR) over the last `period` candles.
+        Uses the 15m timeframe by default.
+        """
+        if "-" in symbol:
+            parts = symbol.split("-")
+            bg_symbol = f"{parts[0]}USDT"
+        else:
+            bg_symbol = symbol
+
+        path = f"/api/v2/spot/market/candles?symbol={bg_symbol}&granularity=15m&limit={period + 1}"
+        response = self.make_api_request("GET", path)
+
+        if not response or str(response.get("code")) != "00000":
+            return 0.0
+
+        data = response.get("data", [])
+        if len(data) < period + 1:
+            return 0.0
+
+        # Sort chronologically (oldest to newest)
+        data = sorted(data, key=lambda x: int(x[0]))
+
+        true_ranges = []
+        for i in range(1, len(data)):
+            high = float(data[i][2])
+            low = float(data[i][3])
+            prev_close = float(data[i - 1][4])
+
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            
+            # Normalize to percentage of close price to use as a multiplier
+            close_price = float(data[i][4])
+            if close_price > 0:
+                true_ranges.append((tr / close_price) * 100)
+            else:
+                 true_ranges.append(0.0)
+
+        if not true_ranges:
+            return 0.0
+
+        atr = sum(true_ranges) / len(true_ranges)
+        return float(atr)
+
+
+    async def _get_buying_power(self, session: aiohttp.ClientSession) -> float:
         try:
-            acct = self.get_account()
+            acct = await self.get_account(session)
             if isinstance(acct, dict):
                 return float(acct.get("buying_power", 0.0) or 0.0)
         except Exception:
             pass
         return 0.0
 
-    def _get_order_by_id(self, symbol: str, order_id: str) -> Optional[dict]:
+    async def _get_order_by_id(self, session: aiohttp.ClientSession, symbol: str, order_id: str) -> Optional[dict]:
         try:
-            orders = self.get_orders(symbol)
+            orders = await self.get_orders(session, symbol)
             results = orders.get("results", []) if isinstance(orders, dict) else []
             for o in results:
                 try:
@@ -547,20 +623,20 @@ class CryptoAPITrading:
         except Exception:
             return 0.0, None
 
-    def _wait_for_order_terminal(self, symbol: str, order_id: str) -> Optional[dict]:
+    async def _wait_for_order_terminal(self, session: aiohttp.ClientSession, symbol: str, order_id: str) -> Optional[dict]:
         """Blocks until order is filled/canceled/rejected, then returns the order dict."""
         terminal = {"filled", "canceled", "cancelled", "rejected", "failed", "error"}
         while True:
-            o = self._get_order_by_id(symbol, order_id)
+            o = await self._get_order_by_id(session, symbol, order_id)
             if not o:
-                time.sleep(1)
+                await asyncio.sleep(1)
                 continue
             st = str(o.get("state", "")).lower().strip()
             if st in terminal:
                 return o
-            time.sleep(1)
+            await asyncio.sleep(1)
 
-    def _reconcile_pending_orders(self) -> None:
+    async def _reconcile_pending_orders(self, session: aiohttp.ClientSession) -> None:
         """
         If the hub/trader restarts mid-order, we keep the pre-order buying_power on disk and
         finish the accounting once the order shows as terminal in Robinhood.
@@ -597,7 +673,7 @@ class CryptoAPITrading:
                             progressed = True
                             continue
 
-                        order = self._wait_for_order_terminal(symbol, order_id)
+                        order = await self._wait_for_order_terminal(session, symbol, order_id)
                         if not order:
                             continue
 
@@ -610,7 +686,7 @@ class CryptoAPITrading:
                             continue
 
                         filled_qty, avg_price = self._extract_fill_from_order(order)
-                        bp_after = self._get_buying_power()
+                        bp_after = await self._get_buying_power(session)
                         bp_delta = float(bp_after) - float(bp_before)
 
                         self._record_trade(
@@ -637,7 +713,7 @@ class CryptoAPITrading:
                         continue
 
                 if not progressed:
-                    time.sleep(1)
+                    await asyncio.sleep(1)
 
         except Exception:
             pass
@@ -829,81 +905,31 @@ class CryptoAPITrading:
 
     @staticmethod
     def _read_long_dca_signal(symbol: str) -> int:
-        """
-        Reads long_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
-
-        Used for:
-        - Start gate: start trades at level 3+
-        - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
-        """
         sym = str(symbol).upper().strip()
-        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
-        path = os.path.join(folder, "long_dca_signal.txt")
         try:
-            with open(path, "r") as f:
-                raw = f.read().strip()
-            val = int(float(raw))
-            return val
+             signals = db_manager.get_signal(sym)
+             return signals.get("long", 0)
         except Exception:
-            return 0
-
+             return 0
 
     @staticmethod
     def _read_short_dca_signal(symbol: str) -> int:
-        """
-        Reads short_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
-
-        Used for:
-        - Start gate: start trades at level 3+
-        - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
-        """
         sym = str(symbol).upper().strip()
-        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
-        path = os.path.join(folder, "short_dca_signal.txt")
         try:
-            with open(path, "r") as f:
-                raw = f.read().strip()
-            val = int(float(raw))
-            return val
+             signals = db_manager.get_signal(sym)
+             return signals.get("short", 0)
         except Exception:
-            return 0
+             return 0
 
     @staticmethod
     def _read_long_price_levels(symbol: str) -> list:
-        """
-        Reads low_bound_prices.html from the per-coin folder and returns a list of LONG (blue) price levels.
-
-        Returned ordering is highest->lowest so:
-          N1 = 1st blue line (top)
-          ...
-          N7 = 7th blue line (bottom)
-        """
         sym = str(symbol).upper().strip()
-        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
-        path = os.path.join(folder, "low_bound_prices.html")
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = (f.read() or "").strip()
-            if not raw:
-                return []
-
-            # Normalize common formats: python-list, comma-separated, newline-separated
-            raw = raw.strip().strip("[]()")
-            raw = raw.replace(",", " ").replace(";", " ").replace("|", " ")
-            raw = raw.replace("\n", " ").replace("\t", " ")
-            parts = [p for p in raw.split() if p]
-
-            vals = []
-            for p in parts:
-                try:
-                    vals.append(float(p))
-                except Exception:
-                    continue
-
-            # De-dupe, then sort high->low for stable N1..N7 mapping
+            levels = db_manager.get_price_levels(sym)
+            longs = levels.get("long", [])
             out = []
             seen = set()
-            for v in vals:
+            for v in longs:
                 k = round(float(v), 12)
                 if k in seen:
                     continue
@@ -1100,28 +1126,25 @@ class CryptoAPITrading:
         self._dca_buy_ts[base] = []
 
 
-    def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
+    async def make_api_request(self, session: aiohttp.ClientSession, method: str, path: str, body: Optional[str] = "") -> Any:
         timestamp = str(int(time.time() * 1000))
         headers = self.get_authorization_header(method, path, body, timestamp)
         url = self.base_url + path
 
         try:
             if method == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    data = await response.json()
             elif method == "POST":
-                response = requests.post(url, headers=headers, json=json.loads(body) if body else {}, timeout=10)
+                async with session.post(url, headers=headers, json=json.loads(body) if body else {}, timeout=10) as response:
+                    data = await response.json()
+            else:
+                return None
 
-            response.raise_for_status()
-            data = response.json()
             # Bitget uses string "00000" or int 0 for success
             if str(data.get("code")) not in ("00000", "0", "None"):
                 return data 
             return data
-        except requests.HTTPError as http_err:
-            try:
-                return response.json()
-            except Exception:
-                return None
         except Exception:
             return None
 
@@ -1145,10 +1168,10 @@ class CryptoAPITrading:
             "Content-Type": "application/json",
         }
 
-    def get_account(self) -> Any:
+    async def get_account(self, session: aiohttp.ClientSession) -> Any:
         # Map to simulate Robinhood's buying power response for the rest of the app
         path = "/api/v2/spot/account/assets?coin=USDT"
-        response = self.make_api_request("GET", path)
+        response = await self.make_api_request(session, "GET", path)
         buying_power = 0.0
         
         if response and str(response.get("code")) == "00000":
@@ -1159,9 +1182,9 @@ class CryptoAPITrading:
                     
         return {"buying_power": buying_power}
 
-    def get_holdings(self) -> Any:
+    async def get_holdings(self, session: aiohttp.ClientSession) -> Any:
         path = "/api/v2/spot/account/assets"
-        response = self.make_api_request("GET", path)
+        response = await self.make_api_request(session, "GET", path)
         
         results = []
         if response and str(response.get("code")) == "00000":
@@ -1175,16 +1198,16 @@ class CryptoAPITrading:
                     })
         return {"results": results}
 
-    def get_trading_pairs(self) -> Any:
+    async def get_trading_pairs(self, session: aiohttp.ClientSession) -> Any:
         path = "/api/v2/spot/public/symbols"
-        response = self.make_api_request("GET", path)
+        response = await self.make_api_request(session, "GET", path)
 
         if not response or str(response.get("code")) != "00000":
             return []
 
         return response.get("data", [])
 
-    def get_orders(self, symbol: str) -> Any:
+    async def get_orders(self, session: aiohttp.ClientSession, symbol: str) -> Any:
         if "-" in symbol:
             parts = symbol.split("-")
             bg_symbol = f"{parts[0]}USDT"
@@ -1192,7 +1215,7 @@ class CryptoAPITrading:
             bg_symbol = symbol
             
         path = f"/api/v2/spot/trade/history-orders?symbol={bg_symbol}"
-        response = self.make_api_request("GET", path)
+        response = await self.make_api_request(session, "GET", path)
         
         results = []
         if response and str(response.get("code")) == "00000":
@@ -1222,8 +1245,8 @@ class CryptoAPITrading:
 
         return {"results": results}
 
-    def calculate_cost_basis(self):
-        holdings = self.get_holdings()
+    async def calculate_cost_basis(self, session: aiohttp.ClientSession):
+        holdings = await self.get_holdings(session)
         if not holdings or "results" not in holdings:
             return {}
 
@@ -1236,7 +1259,7 @@ class CryptoAPITrading:
         cost_basis = {}
 
         for asset_code in active_assets:
-            orders = self.get_orders(f"{asset_code}-USD")
+            orders = await self.get_orders(session, f"{asset_code}-USD")
             if not orders or "results" not in orders:
                 continue
 
@@ -1276,25 +1299,22 @@ class CryptoAPITrading:
 
         return cost_basis
 
-    def get_price(self, symbols: list) -> Dict[str, float]:
+    async def get_price(self, session: aiohttp.ClientSession, symbols: list) -> Tuple[Dict[str, float], Dict[str, float], list]:
         buy_prices = {}
         sell_prices = {}
         valid_symbols = []
 
-        for symbol in symbols:
-            # Map symbol for Bitget (e.g., BTC-USD -> BTCUSDT)
+        async def fetch_one(symbol):
             if symbol == "USDC-USD":
-                continue
-
-            if "-" in symbol:
-                parts = symbol.split("-")
-                bg_symbol = f"{parts[0]}USDT"
-            else:
-                bg_symbol = symbol
-
+                return symbol, None
+            bg_symbol = symbol.split("-")[0] + "USDT" if "-" in symbol else symbol
             path = f"/api/v2/spot/market/tickers?symbol={bg_symbol}"
-            response = self.make_api_request("GET", path)
+            response = await self.make_api_request(session, "GET", path)
+            return symbol, response
 
+        results = await asyncio.gather(*(fetch_one(s) for s in symbols))
+
+        for symbol, response in results:
             if response and str(response.get("code")) == "00000" and response.get("data"):
                 result = response["data"][0]
                 ask = float(result.get("askPr", 0.0))
@@ -1304,19 +1324,13 @@ class CryptoAPITrading:
                 sell_prices[symbol] = bid
                 valid_symbols.append(symbol)
 
-                # Update cache for transient failures later
+                # Update cache
                 try:
                     self._last_good_bid_ask[symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
                 except Exception:
                     pass
             else:
-                # Fallback to cached bid/ask
-                cached = None
-                try:
-                    cached = self._last_good_bid_ask.get(symbol)
-                except Exception:
-                    cached = None
-
+                cached = self._last_good_bid_ask.get(symbol) if hasattr(self, "_last_good_bid_ask") else None
                 if cached:
                     ask = float(cached.get("ask", 0.0) or 0.0)
                     bid = float(cached.get("bid", 0.0) or 0.0)
@@ -1328,8 +1342,9 @@ class CryptoAPITrading:
         return buy_prices, sell_prices, valid_symbols
 
 
-    def place_buy_order(
+    async def place_buy_order(
         self,
+        session: aiohttp.ClientSession,
         client_order_id: str,
         side: str,
         order_type: str,
@@ -1368,7 +1383,7 @@ class CryptoAPITrading:
                 # --- exact profit tracking snapshot (BEFORE placing order) ---
                 buying_power_before = self._get_buying_power()
 
-                response = self.make_api_request("POST", path, json.dumps(body))
+                response = await self.make_api_request(session, "POST", path, json.dumps(body))
                 
                 if response and str(response.get("code")) == "00000":
                     order_id = response.get("data", {}).get("orderId", None)
@@ -1392,7 +1407,7 @@ class CryptoAPITrading:
 
                     # Wait until the order is actually complete in the system
                     if order_id:
-                        order = self._wait_for_order_terminal(symbol, order_id)
+                        order = await self._wait_for_order_terminal(session, symbol, order_id)
                         state = str(order.get("state", "")).lower().strip() if isinstance(order, dict) else ""
                         if state != "filled":
                             try:
@@ -1445,8 +1460,9 @@ class CryptoAPITrading:
 
 
 
-    def place_sell_order(
+    async def place_sell_order(
         self,
+        session: aiohttp.ClientSession,
         client_order_id: str,
         side: str,
         order_type: str,
@@ -1479,7 +1495,7 @@ class CryptoAPITrading:
         # --- exact profit tracking snapshot (BEFORE placing order) ---
         buying_power_before = self._get_buying_power()
 
-        response = self.make_api_request("POST", path, json.dumps(body))
+        response = await self.make_api_request(session, "POST", path, json.dumps(body))
 
         if response and isinstance(response, dict) and str(response.get("code")) == "00000":
             order_id = response.get("data", {}).get("orderId", None)
@@ -1528,7 +1544,7 @@ class CryptoAPITrading:
 
             try:
                 if order_id:
-                    match = self._wait_for_order_terminal(symbol, order_id)
+                    match = await self._wait_for_order_terminal(session, symbol, order_id)
                     if not match:
                         return response
 
@@ -1617,7 +1633,7 @@ class CryptoAPITrading:
 
 
 
-    def manage_trades(self):
+    async def manage_trades(self, session: aiohttp.ClientSession):
         trades_made = False  # Flag to track if any trade was made in this iteration
 
         # Hot-reload coins list + paths + trade params from GUI settings while running
@@ -1654,11 +1670,11 @@ class CryptoAPITrading:
 
 
         # Fetch account details
-        account = self.get_account()
+        account = await self.get_account(session)
         # Fetch holdings
-        holdings = self.get_holdings()
+        holdings = await self.get_holdings(session)
         # Fetch trading pairs
-        trading_pairs = self.get_trading_pairs()
+        trading_pairs = await self.get_trading_pairs(session)
 
         # Use the stored cost_basis instead of recalculating
         cost_basis = self.cost_basis
@@ -1671,7 +1687,7 @@ class CryptoAPITrading:
             if full not in symbols:
                 symbols.append(full)
 
-        current_buy_prices, current_sell_prices, valid_symbols = self.get_price(symbols)
+        current_buy_prices, current_sell_prices, valid_symbols = await self.get_price(session, symbols)
 
         # Calculate total account value (robust: never drop a held coin to $0 on transient API misses)
         snapshot_ok = True
@@ -1920,6 +1936,33 @@ class CryptoAPITrading:
                 print("  PM/Trail: N/A (avg_cost_basis is 0)")
 
 
+            # --- Risk Management: Global Stop Loss ---
+            if avg_cost_basis > 0 and getattr(self, "global_stop_loss_pct", -15.0) < 0:
+                if gain_loss_percentage_sell <= self.global_stop_loss_pct:
+                    print(
+                        f"  [!] GLOBAL STOP-LOSS TRIGGERED for {symbol}. "
+                        f"Sell price {current_sell_price:.8f} dropped to {gain_loss_percentage_sell:.2f}% (Limit: {self.global_stop_loss_pct:.2f}%)."
+                    )
+                    response = self.place_sell_order(
+                        str(uuid.uuid4()),
+                        "sell",
+                        "market",
+                        full_symbol,
+                        quantity,
+                        expected_price=current_sell_price,
+                        avg_cost_basis=avg_cost_basis,
+                        pnl_pct=gain_loss_percentage_sell,
+                        tag="STOP_LOSS",
+                    )
+                    
+                    if response and isinstance(response, dict) and "errors" not in response:
+                        trades_made = True
+                        self.trailing_pm.pop(symbol, None)
+                        self._reset_dca_window_for_trade(symbol, sold=True)
+                        print(f"  Successfully stop-loss liquidated {quantity} {symbol}.")
+                        time.sleep(5)
+                        holdings = self.get_holdings()
+                        continue
 
             # --- Trailing profit margin (0.5% trail gap) ---
             # PM "start line" is the normal 5% / 2.5% line (depending on DCA levels hit).
@@ -1986,28 +2029,32 @@ class CryptoAPITrading:
                             f"  Trailing PM hit for {symbol}. "
                             f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
                         )
-                        response = self.place_sell_order(
+                        # Execute Trailing Sell
+                        print(f"Executing take-profit sell for {full_symbol}!")
+                        response = await self.place_sell_order(
+                            session,
                             str(uuid.uuid4()),
                             "sell",
                             "market",
                             full_symbol,
-                            quantity,
+                            asset_quantity=quantity,
                             expected_price=current_sell_price,
                             avg_cost_basis=avg_cost_basis,
-                            pnl_pct=gain_loss_percentage_sell,
-                            tag="TRAIL_SELL",
+                            pnl_pct=gain_loss_percentage_sell, # Using gain_loss_percentage_sell as current_pct
+                            tag="TRAILING PM"
                         )
 
-                        if response and isinstance(response, dict) and "errors" not in response:
+                        if response and "errors" not in response:
                             trades_made = True
+                            print(f"[trailing_pm] Success: sold {full_symbol} for ~ profit. Dropping PM state.")
                             self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
 
                             # Trade ended -> reset rolling 24h DCA window for this coin
                             self._reset_dca_window_for_trade(symbol, sold=True)
 
                             print(f"  Successfully sold {quantity} {symbol}.")
-                            time.sleep(5)
-                            holdings = self.get_holdings()
+                            await asyncio.sleep(5)
+                            holdings = await self.get_holdings(session)
                             continue
 
 
@@ -2027,7 +2074,20 @@ class CryptoAPITrading:
             current_stage = len(self.dca_levels_triggered.get(symbol, []))
 
             # Hardcoded loss % for this stage (repeat last level after list ends)
-            hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
+            base_hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
+            
+            # --- Risk Management: Dynamic DCA via ATR ---
+            # If enabled, scale the required drop by (1 + ATR%).
+            # This forces the bot to mathematically wait for a deeper drop if volatility is currently high.
+            hard_level = base_hard_level
+            if getattr(self, "dynamic_dca_atr", False):
+                atr_pct = self._get_latest_atr(symbol)
+                if atr_pct > 0:
+                     # Calculate dynamic target: e.g., if base is -5.0% and ATR is 2.0%, new target is -5.0 * (1.0 + (2.0/100)) = -5.1%
+                     # For simplicity, we just add the ATR% directly to widen it, e.g -5.0% base and 2.0% ATR = -7.0% waiting period
+                     hard_level = base_hard_level - atr_pct
+                     print(f"  [ATR Activated] Widened DCA {current_stage + 1} trigger from {base_hard_level:.2f}% to {hard_level:.2f}% (Wait: increased by {atr_pct:.2f}%).")
+
             hard_hit = gain_loss_percentage_buy <= hard_level
 
             # Neural trigger only for first 4 DCA stages
@@ -2065,7 +2125,8 @@ class CryptoAPITrading:
                     )
 
                 elif dca_amount <= buying_power:
-                    response = self.place_buy_order(
+                    response = await self.place_buy_order(
+                        session,
                         str(uuid.uuid4()),
                         "buy",
                         "market",
@@ -2154,8 +2215,13 @@ class CryptoAPITrading:
 
 
         holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
+        
+        # --- Risk Management: Portfolio Exposure Limit ---
+        max_exposure = float(getattr(self, "max_portfolio_exposure_pct", 85.0))
+        if in_use >= max_exposure:
+            print(f"\n[!] Maximum Portfolio Exposure Reached: {in_use:.2f}% (Limit: {max_exposure:.2f}%). Halting new trades.")
+            start_index = len(crypto_symbols) # Force skip new trades loop
 
-        start_index = 0
         while start_index < len(crypto_symbols):
             base_symbol = crypto_symbols[start_index].upper().strip()
             full_symbol = f"{base_symbol}-USD"
@@ -2180,7 +2246,8 @@ class CryptoAPITrading:
 
 
 
-            response = self.place_buy_order(
+            response = await self.place_buy_order(
+                session,
                 str(uuid.uuid4()),
                 "buy",
                 "market",
@@ -2204,18 +2271,17 @@ class CryptoAPITrading:
                     f"Starting new trade for {full_symbol} (AI start signal long={buy_count}, short={sell_count}). "
                     f"Allocating ${allocation_in_usd:.2f}."
                 )
-                time.sleep(5)
-                holdings = self.get_holdings()
+                await asyncio.sleep(5)
+                holdings = await self.get_holdings(session)
                 holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
 
 
             start_index += 1
 
-        # If any trades were made, recalculate the cost basis
         if trades_made:
-            time.sleep(5)
+            await asyncio.sleep(5)
             print("Trades were made in this iteration. Recalculating cost basis...")
-            new_cost_basis = self.calculate_cost_basis()
+            new_cost_basis = await self.calculate_cost_basis(session)
             if new_cost_basis:
                 self.cost_basis = new_cost_basis
                 print("Cost basis recalculated successfully.")
@@ -2251,13 +2317,21 @@ class CryptoAPITrading:
 
 
 
+    async def run_async(self):
+        async with aiohttp.ClientSession() as session:
+            self.cost_basis = await self.calculate_cost_basis(session)
+            self.initialize_dca_levels()
+            await self._reconcile_pending_orders(session)
+            while True:
+                try:
+                    await self.manage_trades(session)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(traceback.format_exc())
+                    await asyncio.sleep(1)
+
     def run(self):
-        while True:
-            try:
-                self.manage_trades()
-                time.sleep(0.5)
-            except Exception as e:
-                print(traceback.format_exc())
+        asyncio.run(self.run_async())
 
 if __name__ == "__main__":
     trading_bot = CryptoAPITrading()

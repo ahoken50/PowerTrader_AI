@@ -537,82 +537,60 @@ while True:
 			high_all_preds = []
 			low_all_predictions = []
 			low_all_preds = []
+			# ----- PANDAS INDICATOR UPGRADE -----
+			import pandas as pd
+			import pandas_ta as ta
+			import numpy as np
+
 			try:
-				open_price_list2 = []
-				open_price_list_index = 0
-				while True:
-					open_price_list2.append(open_price_list[open_price_list_index])
-					open_price_list_index += 1
-					if open_price_list_index >= price_list_length:
-						break
-					else:
-						continue
-			except:
+				# 1. Build DataFrame from raw lists
+				df = pd.DataFrame({
+					'open': open_price_list,
+					'high': high_price_list,
+					'low': low_price_list,
+					'close': price_list,
+					# 'volume': volume_list if it existed, skipping for now as KuCoin block doesn't parse it yet
+				})
+				
+				# 2. Slice to the requested length (equivalent to previous while-loops)
+				df2 = df.iloc[:price_list_length].copy()
+				
+				# 3. Calculate % price changes (Open to Close/High/Low)
+				df2['price_change'] = 100 * ((df2['close'] - df2['open']) / df2['open'])
+				df2['high_price_change'] = 100 * ((df2['high'] - df2['open']) / df2['open'])
+				df2['low_price_change'] = 100 * ((df2['low'] - df2['open']) / df2['open'])
+
+				# 4. Calculate TA-Lib Indicators
+				# RSI
+				df2.ta.rsi(length=14, append=True)
+				# MACD (adds MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9)
+				df2.ta.macd(fast=12, slow=26, signal=9, append=True)
+				# Bollinger Bands (adds BBL_5_2.0, BBM_5_2.0, BBU_5_2.0, BBB_5_2.0, BBP_5_2.0)
+				df2.ta.bbands(length=20, std=2, append=True)
+
+				# Forward fill NaNs created by rolling windows, then fill any remaining with 0
+				df2.ffill(inplace=True)
+				df2.fillna(0, inplace=True)
+
+				# 5. Extract the lists back out for the legacy loops below (backward compatibility)
+				open_price_list2 = df2['open'].tolist()
+				price_list2 = df2['close'].tolist()
+				high_price_list2 = df2['high'].tolist()
+				low_price_list2 = df2['low'].tolist()
+				
+				price_change_list = df2['price_change'].tolist()
+				high_price_change_list = df2['high_price_change'].tolist()
+				low_price_change_list = df2['low_price_change'].tolist()
+
+				# Keep indicator lists available for pattern memory appending
+				rsi_list = df2['RSI_14'].tolist()
+				macd_hist_list = df2['MACDh_12_26_9'].tolist()
+				bb_pct_list = df2['BBP_20_2.0'].tolist()
+
+			except Exception as e:
+				PrintException()
 				break
-			low_all_preds = []
-			try:
-				price_list2 = []
-				price_list_index = 0
-				while True:
-					price_list2.append(price_list[price_list_index])
-					price_list_index += 1
-					if price_list_index >= price_list_length:
-						break
-					else:
-						continue
-			except:
-				break
-			high_price_list2 = []
-			high_price_list_index = 0
-			while True:
-				high_price_list2.append(high_price_list[high_price_list_index])
-				high_price_list_index += 1
-				if high_price_list_index >= price_list_length:
-					break
-				else:
-					continue
-			low_price_list2 = []
-			low_price_list_index = 0
-			while True:
-				low_price_list2.append(low_price_list[low_price_list_index])
-				low_price_list_index += 1
-				if low_price_list_index >= price_list_length:
-					break
-				else:
-					continue
-			index = 0
-			index2 = index+1
-			price_change_list = []
-			while True:
-				price_change = 100*((price_list2[index]-open_price_list2[index])/open_price_list2[index])
-				price_change_list.append(price_change)
-				index += 1
-				if index >= len(price_list2):
-					break
-				else:
-					continue
-			index = 0
-			index2 = index+1
-			high_price_change_list = []
-			while True:
-				high_price_change = 100*((high_price_list2[index]-open_price_list2[index])/open_price_list2[index])
-				high_price_change_list.append(high_price_change)
-				index += 1
-				if index >= len(price_list2):
-					break
-				else:
-					continue
-			index = 0
-			index2 = index+1
-			low_price_change_list = []
-			while True:
-				low_price_change = 100*((low_price_list2[index]-open_price_list2[index])/open_price_list2[index])
-				low_price_change_list.append(low_price_change)
-				index += 1
-				if index >= len(price_list2):
-					break
-				else:
-					continue
+			# ------------------------------------
 			# Check stop signal occasionally (much less disk IO)
 			if should_stop_training(loop_i):
 				exited = 'yes'
@@ -1549,6 +1527,20 @@ while True:
 													except:
 														PrintException()
 														all_current_patterns[highlowind].append(this_diff)
+														
+														# --- PANDAS INDICATOR UPGRADE ---
+														# Fetch the indicator values for the very last candle of this pattern
+														try:
+															cur_rsi = rsi_list[len(rsi_list)-1]
+															cur_macd = macd_hist_list[len(macd_hist_list)-1]
+															cur_bb = bb_pct_list[len(bb_pct_list)-1]
+															
+															# Append them to the pattern array so the kNN can measure emotional context
+															all_current_patterns[highlowind].append(cur_rsi)
+															all_current_patterns[highlowind].append(cur_macd)
+															all_current_patterns[highlowind].append(cur_bb)
+														except Exception as e:
+															pass # fallback gracefully if lists are misaligned
 
 														# build the same memory entry format, but store in RAM
 														mem_entry = str(all_current_patterns[highlowind]).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)

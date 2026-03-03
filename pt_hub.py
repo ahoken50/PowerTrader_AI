@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import glob
 import bisect
+import db_manager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import tkinter as tk
@@ -3110,8 +3111,8 @@ class PowerTraderHub(tk.Tk):
     def start_neural(self) -> None:
         # Reset runner-ready gate file (prevents stale "ready" from a prior run)
         try:
-            with open(self.runner_ready_path, "w", encoding="utf-8") as f:
-                json.dump({"timestamp": time.time(), "ready": False, "stage": "starting"}, f)
+            db_manager.set_process_ready("pt_thinker", False)
+            db_manager.set_setting("thinker_stage", "starting")
         except Exception:
             pass
 
@@ -3144,11 +3145,16 @@ class PowerTraderHub(tk.Tk):
 
     def _read_runner_ready(self) -> Dict[str, Any]:
         try:
-            if os.path.isfile(self.runner_ready_path):
-                with open(self.runner_ready_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
+            is_ready = db_manager.is_process_ready("pt_thinker", timeout_seconds=60)
+            stage = db_manager.get_setting("thinker_stage") or ""
+            ready_coins = db_manager.get_setting("thinker_ready_coins") or []
+            total_coins = db_manager.get_setting("thinker_total_coins") or 0
+            return {
+                "ready": is_ready,
+                "stage": stage,
+                "ready_coins": ready_coins,
+                "total_coins": int(total_coins) if total_coins else 0
+            }
         except Exception:
             pass
         return {"ready": False}
@@ -3425,8 +3431,8 @@ class PowerTraderHub(tk.Tk):
 
         # Also reset the runner-ready gate file (best-effort)
         try:
-            with open(self.runner_ready_path, "w", encoding="utf-8") as f:
-                json.dump({"timestamp": time.time(), "ready": False, "stage": "stopped"}, f)
+            db_manager.set_process_ready("pt_thinker", False)
+            db_manager.set_setting("thinker_stage", "stopped")
         except Exception:
             pass
 
@@ -4499,7 +4505,10 @@ class PowerTraderHub(tk.Tk):
 
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
-
+        # --- Phase 2: Risk Management Settings ---
+        global_stop_loss_var = tk.StringVar(value=str(self.settings.get("global_stop_loss_pct", -15.0)))
+        dynamic_dca_atr_var = tk.BooleanVar(value=bool(self.settings.get("dynamic_dca_atr", False)))
+        max_exposure_var = tk.StringVar(value=str(self.settings.get("max_portfolio_exposure_pct", 85.0)))
 
         neural_script_var = tk.StringVar(value=self.settings["script_neural_runner2"])
         trainer_script_var = tk.StringVar(value=self.settings.get("script_neural_trainer", "pt_trainer.py"))
@@ -4571,8 +4580,13 @@ class PowerTraderHub(tk.Tk):
 
         add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
 
+        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
-
+        ttk.Label(frm, text="--- RISK MANAGEMENT (Phase 2) ---", font=("", 10, "bold"), foreground=DARK_ACCENT2).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 6)); r += 1
+        add_row(r, "Global Stop-Loss % (e.g. -15.0):", global_stop_loss_var); r += 1
+        add_row(r, "Max Portfolio Exposure % (Reserve USDT):", max_exposure_var); r += 1
+        
+        ttk.Checkbutton(frm, text="Enable Dynamic DCA via ATR (Spaces out buys during crashes)", variable=dynamic_dca_atr_var).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 10)); r += 1
 
         ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
@@ -4804,7 +4818,23 @@ class PowerTraderHub(tk.Tk):
                 if md_i < 0:
                     md_i = 0
                 self.settings["max_dca_buys_per_24h"] = md_i
-
+                
+                # --- Risk Management Saves ---
+                try:
+                    sl_pct = float((global_stop_loss_var.get() or "").strip() or -15.0)
+                except:
+                    sl_pct = -15.0
+                if sl_pct > 0: # Ensure it's stored as a negative absolute value
+                    sl_pct = -sl_pct
+                self.settings["global_stop_loss_pct"] = sl_pct
+                
+                self.settings["dynamic_dca_atr"] = bool(dynamic_dca_atr_var.get())
+                
+                try:
+                    max_exp = float((max_exposure_var.get() or "").strip() or 85.0)
+                except:
+                    max_exp = 85.0
+                self.settings["max_portfolio_exposure_pct"] = max_exp
 
                 # --- Trailing PM settings ---
                 try:
